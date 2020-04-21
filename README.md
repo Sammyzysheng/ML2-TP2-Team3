@@ -7,7 +7,7 @@
 <br/>
 <br/>
 <br/>
-###
+
 Over the semester, each team will pick a business-related Kaggle competition, or the Quantopian competition, to research and critique. On the last day of class, the team will give a 15-minute presentation on their Kaggle research project. The presentation should cover 
 1. An overview of the Kaggle/Quantopian competition - what's the objective? where does the dataset come from? what are the key features?
 Background: 
