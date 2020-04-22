@@ -1,0 +1,311 @@
+---
+title: "Energy Predictor"
+author: "Team 3"
+date: "4/22/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(echo = TRUE)
+installIfAbsentAndLoad <- function(neededVector) {
+  for(thispackage in neededVector) {
+    if( ! require(thispackage, character.only = T) )
+    { install.packages(thispackage)}
+    require(thispackage, character.only = T)
+  }
+}
+
+needed <- c('tidyverse','repr','lubridate','gbm','ggplot2','xgboost','Ecdat','reshape2','ggcorrplot','car')  
+installIfAbsentAndLoad(needed)
+options(tibble.width = Inf)
+options(warn=-1)
+```
+
+## Competition/Project Objective
+
+The purpose of this competition/objective is to develop accurate models of metered building energy usage in the following areas: chilled water, electric, hot water, and steam meters.
+
+### How We Arrive At Our Model:
+
+We begin with taking into consideration the background of the competition and make note of any assumptions we might have regarding the project itself or the datasets provided.  
+
+Then we take the following steps to write our notebook and ultimately complete our project: 
+
+#### 1)Load Data
+#### 2)Preprocessing
+#### 3)EDA
+#### 4)Build And Train Model
+#### 5)Outcome Evaluation
+
+## Load Data Into R
+
+As noted on our background section, our competition provided us with 3 seperate data sources.
+```{r read files}
+dpath <- "./"
+train <- read.csv(paste(dpath, "train.csv", sep=""),row.names = NULL)
+building<-read.csv('building_metadata.csv',row.names = NULL)
+weather_train<-read.csv('weather_train.csv',row.names = NULL)
+```
+
+## Preprocessing
+### Joining The Data Tables
+
+Utilizing a left join to merge the building metadata set and weather train set with the train set.
+```{r }
+train<-train%>%
+  left_join(building,by='building_id')%>%
+  left_join(weather_train,by=c('site_id',"timestamp"))
+
+```
+#### Take A Glimpse Of The Data Structure
+
+```{r }
+head(train,5)
+```
+
+### Creating New Variables
+In this instance, we are creating three new variables and tranforming another.
+```{r }
+#Transform the data to days in a week(1,2,3,4,5,6,7)
+train$wday=wday(train$timestamp)
+#Identify whether it's workday or not
+train$workday=ifelse(train$wday %in% c(1,2,3,4,5),1,0)
+#Take out the month information
+train$month=month(train$timestamp)
+#Normalize the target so that it's not scaled
+train$meter_reading=log1p(train$meter_reading)
+```
+
+### Feature Selection
+
+```{r }
+#Select columns as input variables
+names_selected=c("building_id","site_id","meter","primary_use","square_feet","air_temperature","cloud_coverage","wind_direction","wind_speed", "month","workday","meter_reading")
+#Get the new dataset
+train.new=train[names_selected]
+```
+### Converting Categorical Variable To Numeric
+
+```{r }
+#Transfrom "primary_use" variable to numerirical data
+train.new$primary_use=as.integer(as.factor(train.new$primary_use))
+
+```
+
+### Fill In Missing/Null Data
+
+Because the missing data portion is small, we could just use the avaerage to replace the NAs.
+```{r }
+#Deal with air temperature missing data
+train.new$air_temperature[is.na(train.new$air_temperature)] <- mean(train.new$air_temperature, na.rm = TRUE)
+#Deal with cloud coverage mmissing data
+train.new$cloud_coverage[is.na(train.new$cloud_coverage)] <- mean(train.new$cloud_coverage, na.rm = TRUE)
+#Deal with wind direction missing data
+train.new$wind_direction[is.na(train.new$wind_direction)] <- mean(train.new$wind_direction, na.rm = TRUE)
+```
+
+## Exploratory Discriminant Analysis
+### Correlation Plot
+
+```{r cor,echo=FALSE}
+ggcorrplot(cor(train.new), type = "lower", lab = TRUE,
+           title = "Correlation Matrix for All Features")
+```
+
+Potentially significant correlations: square feet correlated with meter reading at 0.37, wind direction with wind speed at 0.42, wind speed with cloud coverage at 0.18.
+Unsurprisingly, building ID and site ID are highly correlated because they are linked.
+Site and building ID are each somewhat correlated with temperature and cloud coverage (due to location)
+
+
+### Evaluate Multicollinearity Between Predictor Variables
+```{r vif,echo=FALSE}
+# Take a subset of data to reduce running time
+train.new.site1=train.new[train.new$site_id==1,]
+# remove meter_reading before checking for VIF
+simple.regression <- lm(meter_reading~.-site_id, data = train.new.site1)
+vif(simple.regression) 
+```
+
+The VIFs of the predictors are all relatively low, with building_id being the only one above ~1. Multicollinearity does not appear to be a concern.
+
+## Build And Train Model
+
+### XGBoost Model
+
+XGBoost is a ensemble method for machine learning which allows parrallel runnning. XGBoost is a powerful tool that has low bias.
+We selected XGBoost for our model because the size of our data, and the flexiblity XGBoost could achieve.
+For our problem, because the data is too large (378MB), and data from different sites may vary.
+We choose to train a seperate model on each site using XGBoost.
+```{r }
+#Extract data from site 1
+train.new.site1=train.new[train.new$site_id==1,]
+#Get number of rows for site 1
+n=nrow(train.new.site1)
+#Sample the data into training and test set
+train.index=sample(seq(1,n),n*0.8,replace = F)
+#Transfrom the training data into matrix before fitting into XGBoost model
+xgb.data.train <- xgb.DMatrix(as.matrix(train.new.site1[train.index, colnames(train.new.site1) != 'meter_reading']), label = train.new.site1$meter_reading[train.index])
+#Transfrom the test data into matrix before fitting into XGBoost model
+xgb.data.test <- xgb.DMatrix(as.matrix(train.new.site1[-train.index, colnames(train.new) != "meter_readings"]), label = train.new.site1$meter_reading[-train.index])
+
+```
+
+### Parameter Tuning
+
+We included 3 hyperparameters in the tuning process.
+```{r }
+# = eta candidates = #
+eta=c(0.05,0.1,0.5)
+# = max_depth candidates = #
+md=c(6,10,12)
+# = sub_sample candidates = #
+ss=c(0.25,0.5,0.75,1)
+```
+
+### ETA
+
+```{r }
+#Define a vector to store rmse data
+test_rmse=c()
+#For each value of eta, the model will produce its test rmse over each round of training
+for(i in 1:length(eta)){
+  #Define parameters in the model
+  params=list(booster = "gbtree",nthread = 4, objective = "reg:squarederror",
+              eta = eta[i], gamma=0, max_depth=10, min_child_weight=1, 
+              subsample=1, colsample_bytree=0.85)
+  #Using cross validation to find how the rmse changes over time
+  xgbcv <- xgb.cv( params = params, data = xgb.data.train , nrounds = 500, nfold = 3, showsd = T, stratified = T, print_every_n = 100, maximize = F)
+  #Get test rmse data
+  test_rmse[i] = xgbcv$evaluation_log[,4]
+  
+}
+#Transfrom test_rmse of each value of eta into a dataframe
+test_rmse = data.frame(iter=1:500,test_rmse)
+#Name the test_rmse dataframe columns
+
+colnames(test_rmse) =  c('iter',eta)
+#Reshape the test_rmse for plotting
+test_rmse = melt(test_rmse, id.vars = "iter")
+
+```
+Plot how each test rmse changes over training iterations
+```{r eta, echo=FALSE}
+
+ggplot(data = test_rmse) + geom_line(aes(x = iter, y = value, color = variable))
+
+```
+The best eta is 0.5.
+
+### Max Depth
+
+```{r }
+#Define a vector to store rmse data
+test_rmse=c()
+#For each value of max depth, the model will produce its test rmse over each round of training
+
+for(i in 1:length(md)){
+   #Define parameters in the model
+
+  params=list(booster = "gbtree",nthread = 4, objective = "reg:squarederror",
+              eta = 0.5, gamma=0, max_depth=md[i], min_child_weight=1, 
+              subsample=1, colsample_bytree=0.85)
+  #Using cross validation to find how the rmse changes over time
+  xgbcv <- xgb.cv( params = params, data = xgb.data.train , nrounds = 500, nfold = 3, showsd = T, stratified = T, print_every_n = 100, maximize = F)
+  #Get test rmse data
+  test_rmse[i] = xgbcv$evaluation_log[,4]
+  
+}
+#Transfrom test_rmse of each value of eta into a dataframe
+
+test_rmse = data.frame(iter=1:500,test_rmse)
+#Name the test_rmse dataframe columns
+
+colnames(test_rmse) =  c('iter',md)
+#Reshape the test_rmse for plotting
+
+test_rmse = melt(test_rmse, id.vars = "iter")
+
+```
+
+Plot how each test rmse changes over training iterations
+
+```{r md, echo=FALSE}
+ggplot(data = test_rmse) + geom_line(aes(x = iter, y = value, color = variable))
+
+```
+
+The best max depth 6.
+
+### Subsample Candidates
+
+```{r }
+#Define a vector to store rmse data
+
+test_rmse=c()
+#For each value of subsample size, the model will produce its test rmse over each round of training
+
+for(i in 1:length(ss)){
+     #Define parameters in the model
+
+  params=list(booster = "gbtree",nthread = 4, objective = "reg:squarederror",
+              eta = 0.5, gamma=0, max_depth=6, min_child_weight=1, 
+              subsample=ss[i], colsample_bytree=0.85)
+    #Using cross validation to find how the rmse changes over time
+
+  xgbcv <- xgb.cv( params = params, data = xgb.data.train , nrounds = 500, nfold = 3, showsd = T, stratified = T, print_every_n = 100, maximize = F)
+    #Get test rmse data
+
+  test_rmse[i] = xgbcv$evaluation_log[,4]
+  
+}
+#Transfrom test_rmse of each value of subsample into a dataframe
+
+test_rmse = data.frame(iter=1:500,test_rmse)
+#Name the test_rmse dataframe columns
+
+colnames(test_rmse) =  c('iter',ss)
+#Reshape the test_rmse for plotting
+
+test_rmse = melt(test_rmse, id.vars = "iter")
+
+```
+Plot how each test rmse changes over training iterations
+
+```{r ss, echo=FALSE}
+ggplot(data = test_rmse) + geom_line(aes(x = iter, y = value, color = variable))
+
+```
+
+The best subsample size is 1.
+
+### Fit Best Model
+
+```{r }
+#Define parameters using the best fit result above
+params=list(booster = "gbtree",nthread = 4, objective = "reg:squarederror",
+            eta = 0.5 , gamma=0, max_depth=6, min_child_weight=1, 
+            subsample=1, colsample_bytree=0.85)
+#Train the data using hyperparameter values
+xgb1 <- xgb.train (params = params, data = xgb.data.train, nrounds = 500, watchlist = list(val=xgb.data.test,train=xgb.data.train), print.every.n = 100, 
+                   early.stop.round = 10, maximize = F , eval_metric = "rmse")
+#See how the model performs on the test data set
+xgb1$evaluation_log[490:500]
+```
+
+## Outcome Evaluation: Feature Importance
+
+```{r }
+#Get the feature importance in the final model
+mat <- xgb.importance (feature_names = colnames(train.new.site1),model = xgb1)
+
+```
+```{r outcome, echo=FALSE}
+xgb.plot.importance (importance_matrix = mat) 
+```
+
+In the plot, we could see that the building_id, meter, and sqaure_feet are most important features in our model, which makes sense.
+Different buildings have different energy consumptions. Based on the type of meter, the energy consumption will vary. And bigger house with more square feet will use more energy.
+
+Further we implemented our model in the test dataset on Kaggle which have no labels.
+
